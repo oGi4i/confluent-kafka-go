@@ -1,24 +1,8 @@
-// Example kafkacat clone written in Golang
 package main
-
-/**
- * Copyright 2016 Confluent Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -28,16 +12,23 @@ import (
 	"syscall"
 )
 
+const (
+	SpringHeaderKey          = "spring_json_header_types"
+	SpringHeaderDefaultValue = "java.lang.String"
+	DoubleQuote              = string('"')
+)
+
 var (
 	verbosity    = 1
 	exitEOF      = false
 	eofCnt       = 0
 	partitionCnt = 0
 	keyDelim     = ""
+	messageDelim = ""
 	sigs         chan os.Signal
 )
 
-func runProducer(config *kafka.ConfigMap, topic string, partition int32) {
+func runProducer(config *kafka.ConfigMap, topic string, headers map[string]string, partition int32, springMetadata map[string]string) {
 	p, err := kafka.NewProducer(config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create producer: %s\n", err)
@@ -107,6 +98,33 @@ func runProducer(config *kafka.ConfigMap, topic string, partition int32) {
 					msg.Value = ([]byte)(vec[1])
 				}
 			} else {
+				if len(headers) != 0 {
+					kafkaHeaders := make([]kafka.Header, 0)
+					springHeaders := make(map[string]string)
+					for k, v := range headers {
+						if len(springMetadata) != 0 {
+							if _, ok := springMetadata[k]; ok {
+								springHeaders[k] = springMetadata[k]
+							} else {
+								springHeaders[k] = SpringHeaderDefaultValue
+							}
+						}
+						if value, ok := springHeaders[k]; ok && value == SpringHeaderDefaultValue {
+							// костыль для решения проблемы парсинга enum
+							kafkaHeaders = append(kafkaHeaders, kafka.Header{Key: k, Value: ([]byte)(DoubleQuote + v + DoubleQuote)})
+						} else {
+							kafkaHeaders = append(kafkaHeaders, kafka.Header{Key: k, Value: ([]byte)(v)})
+						}
+					}
+					if len(springHeaders) != 0 {
+						if jsonString, err := json.Marshal(springHeaders); err != nil {
+							return
+						} else {
+							kafkaHeaders = append(kafkaHeaders, kafka.Header{Key: SpringHeaderKey, Value: jsonString})
+						}
+					}
+					msg.Headers = kafkaHeaders
+				}
 				msg.Value = ([]byte)(line)
 			}
 
@@ -120,7 +138,7 @@ func runProducer(config *kafka.ConfigMap, topic string, partition int32) {
 	p.Close()
 }
 
-func runConsumer(config *kafka.ConfigMap, topics []string) {
+func runConsumer(config *kafka.ConfigMap, topics []string, header bool, messageDelim string) {
 	c, err := kafka.NewConsumer(config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create consumer: %s\n", err)
@@ -153,8 +171,12 @@ func runConsumer(config *kafka.ConfigMap, topics []string) {
 				partitionCnt = 0
 				eofCnt = 0
 			case *kafka.Message:
+				fmt.Printf("timestamp: %s\n", e.Timestamp)
 				if verbosity >= 2 {
-					fmt.Fprintf(os.Stderr, "%% %v:\n", e.TopicPartition)
+					fmt.Fprintf(os.Stderr, "offset: %s\n", e.TopicPartition)
+				}
+				if header {
+					fmt.Printf("headers: %s\n", e.Headers)
 				}
 				if keyDelim != "" {
 					if e.Key != nil {
@@ -163,7 +185,7 @@ func runConsumer(config *kafka.ConfigMap, topics []string) {
 						fmt.Printf("%s", keyDelim)
 					}
 				}
-				fmt.Println(string(e.Value))
+				fmt.Printf("payload: %s\n%s\n", strings.TrimSuffix(string(e.Value), "\n"), messageDelim)
 			case kafka.PartitionEOF:
 				fmt.Fprintf(os.Stderr, "%% Reached %v\n", e)
 				eofCnt++
@@ -171,8 +193,8 @@ func runConsumer(config *kafka.ConfigMap, topics []string) {
 					run = false
 				}
 			case kafka.Error:
-				// Errors should generally be considered as informational, the client will try to automatically recover
 				fmt.Fprintf(os.Stderr, "%% Error: %v\n", e)
+				run = false
 			case kafka.OffsetsCommitted:
 				if verbosity >= 2 {
 					fmt.Fprintf(os.Stderr, "%% %v\n", e)
@@ -191,8 +213,9 @@ type configArgs struct {
 	conf kafka.ConfigMap
 }
 
+//TODO: add String() method
 func (c *configArgs) String() string {
-	return "FIXME"
+	return ""
 }
 
 func (c *configArgs) Set(value string) error {
@@ -215,22 +238,26 @@ func main() {
 	confargs.conf = kafka.ConfigMap{"session.timeout.ms": 6000}
 
 	/* General options */
-	brokers := kingpin.Flag("broker", "Bootstrap broker(s)").Required().String()
+	brokers := kingpin.Flag("brokers", "Bootstrap broker(s)").Short('b').Required().String()
 	kingpin.Flag("config", "Configuration property (prop=val)").Short('X').PlaceHolder("PROP=VAL").SetValue(&confargs)
 	keyDelimArg := kingpin.Flag("key-delim", "Key and value delimiter (empty string=dont print/parse key)").Default("").String()
 	verbosityArg := kingpin.Flag("verbosity", "Output verbosity level").Short('v').Default("1").Int()
 
 	/* Producer mode options */
 	modeP := kingpin.Command("produce", "Produce messages")
-	topic := modeP.Flag("topic", "Topic to produce to").Required().String()
-	partition := modeP.Flag("partition", "Partition to produce to").Default("-1").Int()
+	topic := modeP.Flag("topic", "Topic to produce to").Short('t').Required().String()
+	headers := modeP.Flag("headers", "Produce messages with headers").Short('h').PlaceHolder("HEADER=VALUE").StringMap()
+	partition := modeP.Flag("partition", "Partition to produce to").Short('p').Default("-1").Int()
+	springMetadata := modeP.Flag("spring_metadata", "Add Spring metadata headers").Short('s').PlaceHolder("HEADER=CLASS").StringMap()
 
 	/* Consumer mode options */
 	modeC := kingpin.Command("consume", "Consume messages").Default()
-	group := modeC.Flag("group", "Consumer group").Required().String()
-	topics := modeC.Arg("topic", "Topic(s) to subscribe to").Required().Strings()
+	group := modeC.Flag("group", "Consumer group").Short('g').Required().String()
+	topics := modeC.Flag("topic", "Topic(s) to subscribe to").Short('t').Required().Strings()
+	header := modeC.Flag("headers", "Print headers").Short('h').Bool()
+	messageDelimArg := modeC.Flag("message-delim", "Message delimiter").Default("---").String()
 	initialOffset := modeC.Flag("offset", "Initial offset").Short('o').Default(kafka.OffsetBeginning.String()).String()
-	exitEOFArg := modeC.Flag("eof", "Exit when EOF is reached for all partitions").Bool()
+	exitEOFArg := modeC.Flag("eof", "Exit when EOF is reached for all partitions").Short('e').Bool()
 
 	mode := kingpin.Parse()
 
@@ -241,18 +268,16 @@ func main() {
 
 	switch mode {
 	case "produce":
-		confargs.conf["produce.offset.report"] = true
-		runProducer((*kafka.ConfigMap)(&confargs.conf), *topic, int32(*partition))
+		confargs.conf["default.topic.config"] = kafka.ConfigMap{"produce.offset.report": true}
+		runProducer((*kafka.ConfigMap)(&confargs.conf), *topic, *headers, int32(*partition), *springMetadata)
 
 	case "consume":
 		confargs.conf["group.id"] = *group
 		confargs.conf["go.events.channel.enable"] = true
 		confargs.conf["go.application.rebalance.enable"] = true
-		confargs.conf["auto.offset.reset"] = *initialOffset
-		// Enable generation of PartitionEOF events to track
-		// when end of partition is reached.
-		confargs.conf["enable.partition.eof"] = exitEOF
-		runConsumer((*kafka.ConfigMap)(&confargs.conf), *topics)
+		confargs.conf["default.topic.config"] = kafka.ConfigMap{"auto.offset.reset": *initialOffset}
+		messageDelim = *messageDelimArg
+		runConsumer((*kafka.ConfigMap)(&confargs.conf), *topics, *header, messageDelim)
 	}
 
 }

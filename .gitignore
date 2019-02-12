@@ -1,4 +1,1 @@
-*~
-\#*
-*.prof
-tmp-build
+.idea/*
