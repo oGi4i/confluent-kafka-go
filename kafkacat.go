@@ -34,6 +34,7 @@ func runProducer(config *kafka.ConfigMap, topic string, headers map[string]strin
 		fmt.Fprintf(os.Stderr, "Failed to create producer: %s\n", err)
 		os.Exit(1)
 	}
+	defer p.Close()
 
 	fmt.Fprintf(os.Stderr, "Created Producer %v, topic %s [%d]\n", p, topic, partition)
 
@@ -56,6 +57,8 @@ func runProducer(config *kafka.ConfigMap, topic string, headers map[string]strin
 	reader := bufio.NewReader(os.Stdin)
 	stdinChan := make(chan string)
 
+	defer close(stdinChan)
+
 	go func() {
 		for true {
 			line, err := reader.ReadString('\n')
@@ -70,7 +73,6 @@ func runProducer(config *kafka.ConfigMap, topic string, headers map[string]strin
 
 			stdinChan <- line
 		}
-		close(stdinChan)
 	}()
 
 	run := true
@@ -110,7 +112,7 @@ func runProducer(config *kafka.ConfigMap, topic string, headers map[string]strin
 							}
 						}
 						if value, ok := springHeaders[k]; ok && value == SpringHeaderDefaultValue {
-							// костыль для решения проблемы парсинга enum
+							// fixes enum parsing in Spring
 							kafkaHeaders = append(kafkaHeaders, kafka.Header{Key: k, Value: ([]byte)(DoubleQuote + v + DoubleQuote)})
 						} else {
 							kafkaHeaders = append(kafkaHeaders, kafka.Header{Key: k, Value: ([]byte)(v)})
@@ -135,7 +137,6 @@ func runProducer(config *kafka.ConfigMap, topic string, headers map[string]strin
 	fmt.Fprintf(os.Stderr, "%% Flushing %d message(s)\n", p.Len())
 	p.Flush(10000)
 	fmt.Fprintf(os.Stderr, "%% Closing\n")
-	p.Close()
 }
 
 func runConsumer(config *kafka.ConfigMap, topics []string, header bool, messageDelim string) {
@@ -144,6 +145,7 @@ func runConsumer(config *kafka.ConfigMap, topics []string, header bool, messageD
 		fmt.Fprintf(os.Stderr, "Failed to create consumer: %s\n", err)
 		os.Exit(1)
 	}
+	defer c.Close()
 
 	fmt.Fprintf(os.Stderr, "%% Created Consumer %v\n", c)
 
@@ -176,7 +178,12 @@ func runConsumer(config *kafka.ConfigMap, topics []string, header bool, messageD
 					fmt.Fprintf(os.Stderr, "offset: %s\n", e.TopicPartition)
 				}
 				if header {
-					fmt.Printf("headers: %s\n", e.Headers)
+					headers := make([]Header, 0)
+					for _, v := range e.Headers {
+						headers = append(headers, Header(v))
+					}
+					// trim brackets from array String() method
+					fmt.Printf("headers: %s\n", strings.Trim(fmt.Sprintf("%v", headers), "[]"))
 				}
 				if keyDelim != "" {
 					if e.Key != nil {
@@ -206,7 +213,6 @@ func runConsumer(config *kafka.ConfigMap, topics []string, header bool, messageD
 	}
 
 	fmt.Fprintf(os.Stderr, "%% Closing consumer\n")
-	c.Close()
 }
 
 type configArgs struct {
@@ -224,6 +230,22 @@ func (c *configArgs) Set(value string) error {
 
 func (c *configArgs) IsCumulative() bool {
 	return true
+}
+
+type Header kafka.Header
+
+// override kafka.Header String() method, because it truncates headers
+func (h Header) String() string {
+	if h.Value == nil {
+		return fmt.Sprintf("%s=nil", h.Key)
+	}
+
+	valueLen := len(h.Value)
+	if valueLen == 0 {
+		return fmt.Sprintf("%s=<empty>", h.Key)
+	}
+
+	return fmt.Sprintf("%s='%s'", h.Key, string(h.Value))
 }
 
 func main() {
