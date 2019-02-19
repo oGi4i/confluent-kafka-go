@@ -139,7 +139,7 @@ func runProducer(config *kafka.ConfigMap, topic string, headers map[string]strin
 	fmt.Fprintf(os.Stderr, "%% Closing\n")
 }
 
-func runConsumer(config *kafka.ConfigMap, topics []string, header bool, messageDelim string) {
+func runConsumer(config *kafka.ConfigMap, topics []string, header bool, messageDelim string, offset string) {
 	c, err := kafka.NewConsumer(config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create consumer: %s\n", err)
@@ -164,6 +164,11 @@ func runConsumer(config *kafka.ConfigMap, topics []string, header bool, messageD
 			switch e := ev.(type) {
 			case kafka.AssignedPartitions:
 				fmt.Fprintf(os.Stderr, "%% %v\n", e)
+				if offset != "" {
+					for i, _ := range e.Partitions {
+						e.Partitions[i].Offset.Set(offset)
+					}
+				}
 				c.Assign(e.Partitions)
 				partitionCnt = len(e.Partitions)
 				eofCnt = 0
@@ -278,7 +283,7 @@ func main() {
 	topics := modeC.Flag("topic", "Topic(s) to subscribe to").Short('t').Required().Strings()
 	header := modeC.Flag("headers", "Print headers").Short('h').Bool()
 	messageDelimArg := modeC.Flag("message-delim", "Message delimiter").Default("---").String()
-	initialOffset := modeC.Flag("offset", "Initial offset").Short('o').Default(kafka.OffsetBeginning.String()).String()
+	initialOffset := modeC.Flag("offset", "Initial offset").Short('o').Default(kafka.OffsetStored.String()).String()
 	exitEOFArg := modeC.Flag("eof", "Exit when EOF is reached for all partitions").Short('e').Bool()
 
 	mode := kingpin.Parse()
@@ -297,9 +302,8 @@ func main() {
 		confargs.conf["group.id"] = *group
 		confargs.conf["go.events.channel.enable"] = true
 		confargs.conf["go.application.rebalance.enable"] = true
-		confargs.conf["default.topic.config"] = kafka.ConfigMap{"auto.offset.reset": *initialOffset}
 		messageDelim = *messageDelimArg
-		runConsumer((*kafka.ConfigMap)(&confargs.conf), *topics, *header, messageDelim)
+		runConsumer((*kafka.ConfigMap)(&confargs.conf), *topics, *header, messageDelim, *initialOffset)
 	}
 
 }
